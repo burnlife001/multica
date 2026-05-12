@@ -3,7 +3,7 @@ dist
 *.log
 .DS_Store
 .envrc
-
+.codebase-memory
 # build outputs
 .turbo
 .next

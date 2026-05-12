@@ -7,9 +7,11 @@
     .\__multica-sync.ps1              Interactive menu
     .\__multica-sync.ps1 pull         Fetch upstream/main, merge to local, push to fork
     .\__multica-sync.ps1 build        Rebuild desktop app (NSIS installer)
+    .\__multica-sync.ps1 fast         Fast build + preview (no installer)
     .\__multica-sync.ps1 push         Push current branch to feature/burnlife001
+    .\__multica-sync.ps1 sync         Rsync server/ to remote and rebuild+restart
 .PARAMETER Action
-  Optional: pull | build | push
+  Optional: pull | build | fast | push | sync
 #>
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +29,8 @@ $BUILDER = Join-Path $DESKTOP_DIR "node_modules\.bin\electron-builder.cmd"
 
 # Remote dev server (set empty or $null to use local defaults)
 $REMOTE_DEV_HOST = "192.168.1.123"
+$REMOTE_SSH_USER = "yg"
+$REMOTE_PROJECT_DIR = "~/__work/multica"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 function Write-Red    { Write-Host $args -ForegroundColor Red }
@@ -271,6 +275,90 @@ function Invoke-BuildDev {
     Write-Green "==> Fast build / preview finished ================================="
 }
 
+# ── Sync Remote Server ───────────────────────────────────────────────────────
+# Uses rsync to push local server/ code to the remote dev machine,
+# then rebuilds and restarts the multica server process there.
+function Invoke-SyncRemoteServer {
+    Write-Cyan "==> Sync: local server/ → $REMOTE_SSH_USER@$REMOTE_DEV_HOST =========="
+
+    if (-not $REMOTE_DEV_HOST) {
+        Write-Red "  REMOTE_DEV_HOST is empty — cannot sync."
+        return
+    }
+
+    $localServer = Join-Path $REPO_ROOT "server"
+    if (-not (Test-Path $localServer)) {
+        Write-Red "  Local server/ directory not found at $localServer"
+        return
+    }
+
+    $remoteTarget = "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}:${REMOTE_PROJECT_DIR}"
+
+    # Step 1: check remote git HEAD hash before sync
+    Write-Cyan "  Step 1/3: checking remote code status..."
+    $remoteBefore = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" "md5sum ~/__work/multica/server/go.mod 2>/dev/null"
+    $localMd5 = (Get-FileHash -Algorithm MD5 "$localServer\go.mod").Hash
+    $localMd5Lower = $localMd5.ToLower()
+
+    if ($remoteBefore -match ($localMd5Lower)) {
+        Write-Yellow "  Remote server/go.mod matches local — no changes detected."
+        Write-Green "==> Sync skipped: remote is already up to date ====================="
+        return
+    }
+
+    Write-Yellow "  Remote code differs from local — syncing..."
+
+    # Step 2: zip + scp local server/ to remote (Windows has no rsync)
+    Write-Cyan "  Step 2/3: zip + scp local server/ → remote..."
+    $tmpZip = Join-Path $env:TEMP "multica-server-sync.zip"
+
+    # Use .NET ZipFile so it works on Windows without external tools
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path $tmpZip) { Remove-Item $tmpZip }
+
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $localServer,
+        $tmpZip,
+        [System.IO.Compression.CompressionLevel]::Optimal,
+        $true
+    )
+    Write-Yellow "  Zip size: $([math]::Round((Get-Item $tmpZip).Length/1KB, 0)) KB"
+
+    # Remove stale code first so deleted local files don't linger remotely
+    ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" "rm -rf ${REMOTE_PROJECT_DIR}/server"
+
+    scp $tmpZip "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}:/tmp/multica-server-sync.zip"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "  scp failed"
+        Remove-Item $tmpZip
+        return
+    }
+    ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" "unzip -o /tmp/multica-server-sync.zip -d ${REMOTE_PROJECT_DIR} && rm /tmp/multica-server-sync.zip"
+    Remove-Item $tmpZip
+    Write-Green "  Code synced."
+
+    # Step 3: remote build + restart via systemd
+    Write-Cyan "  Step 3/3: remote build + systemctl restart..."
+    $remoteScript = @"
+export GONOSUMCHECK='*' GONOSUMDB='*' GOPROXY=https://goproxy.cn,direct GOTOOLCHAIN=go1.26.1 && \
+  cd ${REMOTE_PROJECT_DIR}/server && \
+  go build -o ${REMOTE_PROJECT_DIR}/server ./cmd/server/ && \
+  echo 'BUILD OK' && \
+  sudo systemctl stop multica-server.service && \
+  sleep 2 && \
+  sudo fuser -k 8080/tcp 2>/dev/null; \
+  sudo systemctl start multica-server.service && \
+  echo 'RESTART OK' && \
+  sleep 2 && \
+  systemctl status multica-server.service --no-pager -l
+"@
+
+    $remoteResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" $remoteScript 2>&1
+    Write-Host $remoteResult
+
+    Write-Green "==> Remote server synced + restarted ==============================="
+}
+
 # ── Ensure on feature branch ────────────────────────────────────────────────
 function Switch-ToFeatureBranch {
     param([string]$BaseBranch = $MAIN_BRANCH)
@@ -331,15 +419,18 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  4) Push   — commit and push current branch → $FEATURE_BRANCH"
     Write-Host ""
+    Write-Host "  5) Sync   — sync server/ to remote ($REMOTE_DEV_HOST) and restart"
+    Write-Host ""
     Write-Host "  0) Exit"
     Write-Host ""
     Write-Host "===========================================" -ForegroundColor Cyan
-    $choice = Read-Host "  Select [0-4]"
+    $choice = Read-Host "  Select [0-5]"
     switch ($choice) {
         "1" { try { Invoke-Pull } catch { Write-Red "Pull failed: $_" } }
         "2" { try { Invoke-Buildexe } catch { Write-Red "Build failed: $_" } }
         "3" { try { Invoke-BuildDev } catch { Write-Red "Fast build failed: $_" } }
         "4" { try { Invoke-PushFeature } catch { Write-Red "Push failed: $_" } }
+        "5" { try { Invoke-SyncRemoteServer } catch { Write-Red "Sync failed: $_" } }
         "0" { Write-Host "Bye."; exit 0 }
         default { Write-Red "  Invalid choice: $choice" }
     }
@@ -359,6 +450,7 @@ function Main {
         "build" { try { Invoke-Buildexe } catch { Write-Red "Build failed: $_"; exit 1 } }
         "fast" { try { Invoke-BuildDev } catch { Write-Red "Fast build failed: $_"; exit 1 } }
         "push"  { try { Invoke-PushFeature } catch { Write-Red "Push failed: $_"; exit 1 } }
+        "sync"  { try { Invoke-SyncRemoteServer } catch { Write-Red "Sync failed: $_"; exit 1 } }
         default {
             while ($true) { Show-Menu }
         }

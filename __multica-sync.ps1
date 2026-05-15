@@ -191,11 +191,32 @@ function Invoke-Buildexe {
   ; Reserve for future use
 !macroend
 '@
-    if (-not (Test-Path (Join-Path $DESKTOP_DIR "build"))) {
-        New-Item -ItemType Directory -Path (Join-Path $DESKTOP_DIR "build") -Force | Out-Null
+    if (-not (Test-Path $nsisScript)) {
+        if (-not (Test-Path (Join-Path $DESKTOP_DIR "build"))) {
+            New-Item -ItemType Directory -Path (Join-Path $DESKTOP_DIR "build") -Force | Out-Null
+        }
+        Set-Content -Path $nsisScript -Value $nsisContent
+        Write-Yellow "    NSIS install script written → build\installer.nsh"
+    } else {
+        Write-Yellow "    NSIS install script already exists, skipping → build\installer.nsh"
     }
-    Set-Content -Path $nsisScript -Value $nsisContent
-    Write-Yellow "    NSIS install script written → build\installer.nsh"
+
+    # Ensure node_modules exist before electron-builder runs
+    $desktopNodeModules = Join-Path $DESKTOP_DIR "node_modules"
+    if (-not (Test-Path $desktopNodeModules) -or -not (Test-Path $BUILDER)) {
+        Write-Yellow "    node_modules or electron-builder missing — running pnpm install..."
+        Push-Location $REPO_ROOT
+        try {
+            $installResult = pnpm install 2>&1
+        } finally {
+            Pop-Location
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Red $installResult
+            throw "pnpm install failed"
+        }
+        Write-Green "    pnpm install OK"
+    }
 
     Write-Cyan "  Step 3/3: electron-builder --win x64 (version=$version) ..."
     $builderArgs = @(
@@ -211,12 +232,29 @@ function Invoke-Buildexe {
         "-c.nsis.include=build/installer.nsh"
     )
 
+    # electron-builder detects the package manager by looking for a lock file
+    # in the app directory. The real pnpm-lock.yaml lives at the repo root
+    # (monorepo). Without this copy, electron-builder falls back to npm,
+    # which then fails with ELSPROBLEMS on pnpm workspace symlinks.
+    $rootLock   = Join-Path $REPO_ROOT "pnpm-lock.yaml"
+    $desktopLock = Join-Path $DESKTOP_DIR "pnpm-lock.yaml"
+    $cleanupLock = $false
+    if ((Test-Path $rootLock) -and -not (Test-Path $desktopLock)) {
+        Copy-Item $rootLock $desktopLock
+        $cleanupLock = $true
+        Write-Yellow "    copied pnpm-lock.yaml → apps/desktop/ (pnpm detection)"
+    }
+
     $env:CSC_IDENTITY_AUTO_DISCOVERY = "false"
     Push-Location $DESKTOP_DIR
     try {
         $packageResult = & $BUILDER @builderArgs 2>&1
     } finally {
         Pop-Location
+        if ($cleanupLock) {
+            Remove-Item $desktopLock -ErrorAction SilentlyContinue
+            Write-Yellow "    removed temporary pnpm-lock.yaml from apps/desktop/"
+        }
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Red $packageResult

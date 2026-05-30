@@ -8,6 +8,9 @@ files:
   - "!electron.vite.config.*"
   - "!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}"
   - "!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}"
+  # Dependencies are bundled by electron-vite (see electron.vite.config.ts),
+  # so node_modules does not need to be shipped. Excluding it avoids EPERM
+  # errors from electron-builder crawling the pnpm virtual store on Windows.
   - "!node_modules/**"
 protocols:
   - name: Multica

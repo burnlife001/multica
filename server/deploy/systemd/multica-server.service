@@ -1,0 +1,22 @@
+[Unit]
+Description=Multica Server
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=yg
+WorkingDirectory=/home/yg/__work/multica
+EnvironmentFile=/home/yg/__work/multica/.env
+Environment=GONOSUMCHECK=*
+Environment=GONOSUMDB=*
+Environment=GOFLAGS=-mod=mod
+Environment=GOPROXY=https://goproxy.cn,direct
+ExecStart=/home/yg/__work/multica/server/bin/multica-server
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/yg/__work/multica/logs/server.log
+StandardError=append:/home/yg/__work/multica/logs/server.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,14 +1,72 @@
 import { resolve } from "path";
-import { defineConfig, externalizeDepsPlugin } from "electron-vite";
+import { defineConfig } from "electron-vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
+// Only externalise Electron and Node built-ins.
+// Bundling everything else removes the need to ship node_modules in the
+// packaged asar, which avoids EPERM errors from electron-builder crawling
+// the pnpm virtual-store (node_modules/.pnpm) on Windows.
+const builtinExternals = [
+  /^electron(\/.*)?$/,
+  /^node:/,
+  "assert",
+  "async_hooks",
+  "buffer",
+  "child_process",
+  "cluster",
+  "console",
+  "constants",
+  "crypto",
+  "dgram",
+  "dns",
+  "domain",
+  "events",
+  "fs",
+  "http",
+  "http2",
+  "https",
+  "inspector",
+  "module",
+  "net",
+  "os",
+  "path",
+  "perf_hooks",
+  "process",
+  "punycode",
+  "querystring",
+  "readline",
+  "repl",
+  "stream",
+  "string_decoder",
+  "sys",
+  "timers",
+  "tls",
+  "trace_events",
+  "tty",
+  "url",
+  "util",
+  "v8",
+  "vm",
+  "wasi",
+  "worker_threads",
+  "zlib",
+];
+
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    build: {
+      rollupOptions: {
+        external: builtinExternals,
+      },
+    },
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
+    build: {
+      rollupOptions: {
+        external: builtinExternals,
+      },
+    },
   },
   renderer: {
     server: {

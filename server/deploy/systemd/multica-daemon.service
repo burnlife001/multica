@@ -1,0 +1,23 @@
+[Unit]
+Description=Multica Daemon
+After=network.target multica-server.service
+Wants=multica-server.service
+
+[Service]
+Type=simple
+User=yg
+WorkingDirectory=/home/yg/__work/multica
+EnvironmentFile=/home/yg/__work/multica/.env
+Environment=GONOSUMCHECK=*
+Environment=GONOSUMDB=*
+Environment=GOFLAGS=-mod=mod
+Environment=GOPROXY=https://goproxy.cn,direct
+Environment="PATH=/home/yg/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/yg/__work/multica/server/bin/multica daemon start --foreground
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/yg/__work/multica/logs/daemon.log
+StandardError=append:/home/yg/__work/multica/logs/daemon.log
+
+[Install]
+WantedBy=multi-user.target

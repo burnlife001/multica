@@ -84,6 +84,27 @@ function Get-DevVersion {
     return "$version-dev"
 }
 
+# ── Desktop Runtime Config ───────────────────────────────────────────────────
+# Writes ~/.multica/desktop.json so the packaged app connects to the right
+# server instead of falling back to https://api.multica.ai.
+function Write-DesktopConfig {
+    $configHost = if ($REMOTE_DEV_HOST) { $REMOTE_DEV_HOST } else { "localhost" }
+    $configDir = Join-Path $env:USERPROFILE ".multica"
+    if (-not (Test-Path $configDir)) {
+        New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+    }
+    $configContent = @"
+{
+  "schemaVersion": 1,
+  "apiUrl": "http://${configHost}:8080",
+  "wsUrl": "ws://${configHost}:8080/ws",
+  "appUrl": "http://${configHost}:3000"
+}
+"@
+    Set-Content -Path (Join-Path $configDir "desktop.json") -Value $configContent -NoNewline
+    Write-Yellow "    wrote $configDir\desktop.json → $configHost"
+}
+
 # ── Pull ─────────────────────────────────────────────────────────────────────
 function Invoke-Pull {
     Write-Cyan "==> Pull: fetch upstream + merge + push to fork =================="
@@ -152,8 +173,39 @@ function Invoke-Buildexe {
     $version = Get-DevVersion
     Write-Cyan "  Desktop version → $version"
 
-    # Step 2: electron-vite build (produces out/ bundles)
-    Write-Cyan "  Step 1/3: pnpm --filter $DESKTOP_FILTER build ..."
+    # Step 2: ensure Go CLI binary is built (needed by bundle-cli.mjs inside
+    # the pnpm build script).  Go is not in PATH by default on Windows;
+    # if it is absent from PATH we try D:\programs\go\bin before failing.
+    Write-Cyan "  Step 1/4: building multica CLI (Go) for desktop bundling ..."
+    $goBin = (Get-Command go -ErrorAction SilentlyContinue).Source
+    if (-not $goBin) {
+        $goCandidate = "D:\programs\go\bin\go.exe"
+        if (Test-Path $goCandidate) { $goBin = $goCandidate }
+    }
+    if ($goBin) {
+        # Add Go to PATH so that the bundle-cli.mjs called inside `pnpm build`
+        # can find it too (pnpm spawns a separate Node process).
+        $goDir = Split-Path -Parent $goBin
+        if ($env:PATH -notlike "*$goDir*") {
+            $env:PATH = "$goDir;$env:PATH"
+        }
+        $env:GOPATH = "D:\programs\go\gopath"
+        $env:GOPROXY = "https://goproxy.cn,direct"
+        $env:GONOSUMCHECK = "*"
+        $env:GONOSUMDB = "*"
+        $bundleScript = Join-Path $DESKTOP_DIR "scripts\bundle-cli.mjs"
+        $bundleResult = & node $bundleScript 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Red $bundleResult
+            throw "bundle-cli failed — CLI binary not built"
+        }
+        Write-Green "  CLI bundle OK"
+    } else {
+        Write-Yellow "  Go not found — skipping CLI build. Install Go to D:\programs\go for full build."
+    }
+
+    # Step 3: electron-vite build (produces out/ bundles)
+    Write-Cyan "  Step 2/4: pnpm --filter $DESKTOP_FILTER build ..."
     $buildResult = pnpm --filter $DESKTOP_FILTER build 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Red $buildResult
@@ -171,7 +223,7 @@ function Invoke-Buildexe {
     #   -c.publish.releaseType=draft         publish as draft (no auto-update)
     #   -c.publish.publishAutoUpdate=false   suppress auto-update metadata
     #
-    Write-Cyan "  Step 2/3: clearing electron-builder caches that may be corrupt..."
+    Write-Cyan "  Step 3/4: clearing electron-builder caches that may be corrupt..."
     $cacheDir = "$env:LOCALAPPDATA\electron-builder\Cache"
     if (Test-Path "$cacheDir\winCodeSign") {
         Remove-Item -Recurse -Force "$cacheDir\winCodeSign"
@@ -218,7 +270,17 @@ function Invoke-Buildexe {
         Write-Green "    pnpm install OK"
     }
 
-    Write-Cyan "  Step 3/3: electron-builder --win x64 (version=$version) ..."
+    # Clean up stale installers so we never ship an old artefact by accident.
+    $dist = Join-Path $DESKTOP_DIR "dist"
+    $staleExes = Get-ChildItem $dist -Filter "multica-desktop-*-windows-x64.exe" -ErrorAction SilentlyContinue
+    $staleBlockmaps = Get-ChildItem $dist -Filter "multica-desktop-*-windows-x64.exe.blockmap" -ErrorAction SilentlyContinue
+    if ($staleExes -or $staleBlockmaps) {
+        Write-Yellow "    removing stale .exe / .blockmap in dist\ ..."
+        $staleExes | Remove-Item -Force -ErrorAction SilentlyContinue
+        $staleBlockmaps | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Cyan "  Step 4/4: electron-builder --win x64 (version=$version) ..."
     $builderArgs = @(
         "--win", "--x64",
         "-c.win.signAndEditExecutable=false",
@@ -332,14 +394,37 @@ function Invoke-SyncRemoteServer {
 
     $remoteTarget = "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}:${REMOTE_PROJECT_DIR}"
 
-    # Step 1: check remote git HEAD hash before sync
-    Write-Cyan "  Step 1/3: checking remote code status..."
-    $remoteBefore = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" "md5sum ~/__work/multica/server/go.mod 2>/dev/null"
-    $localMd5 = (Get-FileHash -Algorithm MD5 "$localServer\go.mod").Hash
-    $localMd5Lower = $localMd5.ToLower()
+    # Step 1: compute a fingerprint of the entire local server/ tree
+    Write-Cyan "  Step 1/4: checking remote code status..."
+    $localFingerprint = Get-ChildItem -Recurse -File $localServer |
+        Sort-Object FullName |
+        ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc)" } |
+        Join-String -Separator "`n" |
+        ForEach-Object { [System.BitConverter]::ToString(
+            [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                [System.Text.Encoding]::UTF8.GetBytes($_)
+            )
+        ).Replace("-", "").ToLower() }
 
-    if ($remoteBefore -match ($localMd5Lower)) {
-        Write-Yellow "  Remote server/go.mod matches local — no changes detected."
+    # Use a single-quoted string so PowerShell does NOT interpolate $variables.
+    # awk command uses double quotes so no nested single-quote escaping is needed.
+    $remoteCmd = '
+        if [ -d ~/__work/multica/server ]; then
+            find ~/__work/multica/server -type f | sort | while read f; do
+                stat -c "%n|%s|%Y" "$f"
+            done | sha256sum | awk "{print \$1}"
+        else
+            echo MISSING
+        fi
+    '
+    $remoteFingerprint = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" ($remoteCmd -replace '\r') 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "  SSH fingerprint check failed (exit $LASTEXITCODE): $remoteFingerprint"
+        throw "SSH connection to remote failed"
+    }
+
+    if ($remoteFingerprint -match $localFingerprint) {
+        Write-Yellow "  Remote server/ matches local — no changes detected."
         Write-Green "==> Sync skipped: remote is already up to date ====================="
         return
     }
@@ -347,7 +432,7 @@ function Invoke-SyncRemoteServer {
     Write-Yellow "  Remote code differs from local — syncing..."
 
     # Step 2: zip + scp local server/ to remote (Windows has no rsync)
-    Write-Cyan "  Step 2/3: zip + scp local server/ → remote..."
+    Write-Cyan "  Step 2/4: zip + scp local server/ → remote..."
     $tmpZip = Join-Path $env:TEMP "multica-server-sync.zip"
 
     # Use .NET ZipFile so it works on Windows without external tools
@@ -364,37 +449,125 @@ function Invoke-SyncRemoteServer {
 
     # Remove stale code first so deleted local files don't linger remotely
     ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" "rm -rf ${REMOTE_PROJECT_DIR}/server"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "  SSH rm -rf failed (exit $LASTEXITCODE)"
+        Remove-Item $tmpZip
+        throw "Failed to remove remote stale server/ directory"
+    }
 
     scp $tmpZip "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}:/tmp/multica-server-sync.zip"
     if ($LASTEXITCODE -ne 0) {
-        Write-Red "  scp failed"
+        Write-Red "  scp failed (exit $LASTEXITCODE)"
         Remove-Item $tmpZip
-        return
+        throw "scp upload failed"
     }
-    ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" "unzip -o /tmp/multica-server-sync.zip -d ${REMOTE_PROJECT_DIR} && rm /tmp/multica-server-sync.zip"
+    $unzipResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" "unzip -o /tmp/multica-server-sync.zip -d ${REMOTE_PROJECT_DIR} && rm /tmp/multica-server-sync.zip" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "  Remote unzip failed (exit $LASTEXITCODE): $unzipResult"
+        Remove-Item $tmpZip
+        throw "Remote unzip failed"
+    }
     Remove-Item $tmpZip
     Write-Green "  Code synced."
 
-    # Step 3: remote build + restart via systemd
-    Write-Cyan "  Step 3/3: remote build + systemctl restart..."
-    $remoteScript = @"
-export GONOSUMCHECK='*' GONOSUMDB='*' GOPROXY=https://goproxy.cn,direct GOTOOLCHAIN=go1.26.1 && \
-  cd ${REMOTE_PROJECT_DIR}/server && \
-  go build -o ${REMOTE_PROJECT_DIR}/server ./cmd/server/ && \
-  echo 'BUILD OK' && \
-  sudo systemctl stop multica-server.service && \
-  sleep 2 && \
-  sudo fuser -k 8080/tcp 2>/dev/null; \
-  sudo systemctl start multica-server.service && \
-  echo 'RESTART OK' && \
-  sleep 2 && \
-  systemctl status multica-server.service --no-pager -l
-"@
+    # Step 3: remote build (server + daemon)
+    Write-Cyan "  Step 3/4: remote build..."
+    $buildScript = @'
+set -e
+export GONOSUMCHECK='*' GONOSUMDB='*' GOPROXY=https://goproxy.cn,direct GOTOOLCHAIN=go1.26.1
+cd ~/__work/multica/server
+mkdir -p bin
+start_time=$(date +%s)
+go build -o bin/multica-server ./cmd/server/
+go build -o bin/multica ./cmd/multica/
+end_time=$(date +%s)
+elapsed=$((end_time - start_time))
+echo "BUILD OK (${elapsed}s)"
+'@
+    $buildResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" ($buildScript -replace '\r') 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "  Remote build failed (exit $LASTEXITCODE):"
+        Write-Host $buildResult
+        throw "Remote go build failed"
+    }
+    Write-Host $buildResult
+    Write-Green "  Build OK."
 
-    $remoteResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" $remoteScript 2>&1
-    Write-Host $remoteResult
+    # Step 3.5: ensure systemd service files exist and are up to date
+    Write-Cyan "  Step 3.5/5: ensuring systemd services..."
+    $serviceScript = @'
+set -e
+SERVER_SERVICE="/etc/systemd/system/multica-server.service"
+DAEMON_SERVICE="/etc/systemd/system/multica-daemon.service"
+LOCAL_SERVER="/home/yg/__work/multica/server/deploy/systemd/multica-server.service"
+LOCAL_DAEMON="/home/yg/__work/multica/server/deploy/systemd/multica-daemon.service"
 
-    Write-Green "==> Remote server synced + restarted ==============================="
+# Copy from version-controlled files if they differ or don't exist
+if [ ! -f "$SERVER_SERVICE" ] || ! diff -q "$LOCAL_SERVER" "$SERVER_SERVICE" > /dev/null 2>&1; then
+    sudo cp "$LOCAL_SERVER" "$SERVER_SERVICE"
+    echo 'SERVER_SERVICE_UPDATED'
+fi
+
+if [ ! -f "$DAEMON_SERVICE" ] || ! diff -q "$LOCAL_DAEMON" "$DAEMON_SERVICE" > /dev/null 2>&1; then
+    sudo cp "$LOCAL_DAEMON" "$DAEMON_SERVICE"
+    echo 'DAEMON_SERVICE_UPDATED'
+fi
+
+sudo systemctl daemon-reload
+sudo systemctl enable multica-server.service
+sudo systemctl enable multica-daemon.service
+echo 'SERVICES_OK'
+'@
+    $serviceResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" ($serviceScript -replace '\r') 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "  Service setup failed (exit $LASTEXITCODE):"
+        Write-Host $serviceResult
+        throw "Remote service setup failed"
+    }
+    Write-Host $serviceResult
+    Write-Green "  Services OK."
+
+    # Step 4: stop + start service and verify
+    Write-Cyan "  Step 4/5: restart service and verify..."
+    $restartScript = @'
+set -e
+sudo systemctl stop multica-server.service || true
+sudo systemctl stop multica-daemon.service || true
+sleep 2
+sudo fuser -k 8080/tcp 2>/dev/null || true
+sudo systemctl start multica-server.service
+sleep 1
+sudo systemctl start multica-daemon.service
+echo 'RESTART OK'
+sleep 3
+# Verify: services must be active and listening on 8080
+if ! systemctl is-active --quiet multica-server.service; then
+    echo 'RESTART FAILED: multica-server not active'
+    systemctl status multica-server.service --no-pager -l
+    exit 1
+fi
+if ! systemctl is-active --quiet multica-daemon.service; then
+    echo 'RESTART FAILED: multica-daemon not active'
+    systemctl status multica-daemon.service --no-pager -l
+    exit 1
+fi
+if ! ss -tlnp | grep -q ':8080'; then
+    echo 'RESTART FAILED: port 8080 not listening'
+    exit 1
+fi
+echo 'VERIFY OK'
+'@
+    $restartResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" ($restartScript -replace '\r') 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "  Service restart or verification failed (exit $LASTEXITCODE):"
+        Write-Host $restartResult
+        throw "Remote service restart failed"
+    }
+    Write-Host $restartResult
+
+    Write-DesktopConfig
+
+    Write-Green "==> Remote server synced + restarted + verified ==================="
 }
 
 # ── Ensure on feature branch ────────────────────────────────────────────────
@@ -457,7 +630,7 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  4) Push   — commit and push current branch → $FEATURE_BRANCH"
     Write-Host ""
-    Write-Host "  5) Sync   — sync server/ to remote ($REMOTE_DEV_HOST) and restart"
+    Write-Host "  5) Sync   — sync server/ to remote ($REMOTE_DEV_HOST), build, restart, verify"
     Write-Host ""
     Write-Host "  0) Exit"
     Write-Host ""

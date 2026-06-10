@@ -447,8 +447,22 @@ function Invoke-SyncRemoteServer {
     }
 
     if ($remoteFingerprint -match $localFingerprint) {
-        Write-Yellow "  Remote server/ matches local — no changes detected."
-        Write-Green "==> Sync skipped: remote is already up to date ====================="
+        Write-Yellow "  Remote server/ matches local — no code changes detected."
+        Write-Yellow "  Still running migrate up to ensure DB schema is in sync (idempotent)..."
+        $migrateOnlyScript = @'
+set -e
+cd ~/__work/multica/server
+go run ./cmd/migrate/ up
+echo 'MIGRATE_OK'
+'@
+        $migrateOnlyResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" ($migrateOnlyScript -replace '\r') 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Red "  migrate up failed (exit $LASTEXITCODE):"
+            Write-Host $migrateOnlyResult
+            throw "migrate up failed"
+        }
+        Write-Host $migrateOnlyResult
+        Write-Green "==> Sync skipped: remote code is up to date, migrations applied ============="
         return
     }
 
@@ -616,6 +630,31 @@ echo 'VERIFY OK (daemon)'
     } else {
         Write-Green "==> Remote server synced + restarted + verified ==================="
     }
+
+    # Step 5/5: apply pending schema migrations on remote.
+    # Runs AFTER the server binary restart so the new code is live; the
+    # migration runner's `schema_migrations` table is idempotent (re-running
+    # `up` on an already-applied migration is a no-op), so this is safe to
+    # keep in the hot path. Without this step, code that adds a new column
+    # (e.g. 081_runtime_timezone) ships in the binary but the DB never gets
+    # the matching schema, and the next /api/daemon/register call from any
+    # local daemon returns 500 with SQLSTATE 42703 - surfacing in the UI as
+    # "暂无可用运行时" on the Create Agent dialog.
+    Write-Cyan "  Step 5/5: running pending migrations on remote..."
+    $migrateScript = @'
+set -e
+cd ~/__work/multica/server
+go run ./cmd/migrate/ up
+echo 'MIGRATE_OK'
+'@
+    $migrateResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" ($migrateScript -replace '\r') 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "  migrate up failed (exit $LASTEXITCODE):"
+        Write-Host $migrateResult
+        throw "migrate up failed"
+    }
+    Write-Host $migrateResult
+    Write-Green "  Migrations OK."
 
     Write-DesktopConfig
 }

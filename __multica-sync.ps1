@@ -10,8 +10,10 @@
     .\__multica-sync.ps1 fast         Fast build + preview (no installer)
     .\__multica-sync.ps1 push         Push current branch to feature/burnlife001
     .\__multica-sync.ps1 sync         Rsync server/ to remote and rebuild+restart
+    .\__multica-sync.ps1 login        Authenticate remote daemon (one-time)
+    .\__multica-sync.ps1 code [email] Fetch latest dev verification code for an email
 .PARAMETER Action
-  Optional: pull | build | fast | push | sync
+  Optional: pull | build | fast | push | sync | login | code [email]
 #>
 
 $ErrorActionPreference = "Stop"
@@ -157,6 +159,12 @@ function Invoke-Pull {
             git checkout $originalBranch
         }
 
+        # Rebase feature branch onto latest main
+        if ($originalBranch -ne $MAIN_BRANCH) {
+            Write-Cyan "  Rebasing $originalBranch onto $MAIN_BRANCH..."
+            git rebase $MAIN_BRANCH
+        }
+
         # Pop stash
         if ($stashed) {
             Write-Cyan "  Popping stash..."
@@ -293,6 +301,21 @@ function Invoke-Buildexe {
         "-c.nsis.allowToChangeInstallationDirectory=true",
         "-c.nsis.include=build/installer.nsh"
     )
+
+    # Route Electron + electron-builder asset downloads through the
+    # npmmirror.com mirror. The default GitHub release URL
+    # (release-assets.githubusercontent.com) is blocked on networks that
+    # can't reach GitHub — that is what made the previous build fail with
+    # "dial tcp [::1]:443: connectex: No connection could be made".
+    # The mirror URL layout matches what electron-download expects:
+    #   ${ELECTRON_MIRROR}/v<version>/electron-v<version>-<platform>-<arch>.zip
+    # The same pattern is used elsewhere in this script for Go modules
+    # (GOPROXY=https://goproxy.cn,direct), since pnpm itself already
+    # points at https://registry.npmmirror.com.
+    $env:ELECTRON_MIRROR                  = "https://npmmirror.com/mirrors/electron/"
+    $env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
+    Write-Yellow "    ELECTRON_MIRROR = $env:ELECTRON_MIRROR"
+    Write-Yellow "    ELECTRON_BUILDER_BINARIES_MIRROR = $env:ELECTRON_BUILDER_BINARIES_MIRROR"
 
     # electron-builder detects the package manager by looking for a lock file
     # in the app directory. The real pnpm-lock.yaml lives at the repo root
@@ -540,22 +563,43 @@ sleep 1
 sudo systemctl start multica-daemon.service
 echo 'RESTART OK'
 sleep 3
-# Verify: services must be active and listening on 8080
+# Server (8080) is the critical piece for the desktop app — it MUST be up.
 if ! systemctl is-active --quiet multica-server.service; then
     echo 'RESTART FAILED: multica-server not active'
     systemctl status multica-server.service --no-pager -l
-    exit 1
-fi
-if ! systemctl is-active --quiet multica-daemon.service; then
-    echo 'RESTART FAILED: multica-daemon not active'
-    systemctl status multica-daemon.service --no-pager -l
     exit 1
 fi
 if ! ss -tlnp | grep -q ':8080'; then
     echo 'RESTART FAILED: port 8080 not listening'
     exit 1
 fi
-echo 'VERIFY OK'
+echo 'VERIFY OK (server)'
+
+# Daemon (local agent runtime) is OPTIONAL — the desktop app's critical
+# dependency is the multica-server (8080) above. The daemon only matters
+# for local-runtime workflows, and it can fail for reasons that have
+# nothing to do with the deploy itself:
+#   - not authenticated (needs a one-time `multica login` on the remote)
+#   - no agent CLI on PATH (claude/codex/etc. not installed)
+# Treat any daemon failure as a soft warning, surface the actual reason
+# from its log file (stdout/stderr go to ~/__work/multica/logs/daemon.log,
+# not the journal, per the systemd unit), and let sync report success
+# as long as the server is healthy.
+if ! systemctl is-active --quiet multica-daemon.service; then
+    DAEMON_LOG="$HOME/__work/multica/logs/daemon.log"
+    DAEMON_REASON="(no log found at $DAEMON_LOG)"
+    if [ -r "$DAEMON_LOG" ]; then
+        DAEMON_REASON="$(tail -50 "$DAEMON_LOG" | grep -E 'Error:|ERR ' | tail -3 | tr '\n' ' ')"
+    fi
+    echo 'DAEMON_SKIP: multica-daemon is not running.'
+    echo "             Latest error: ${DAEMON_REASON:-unknown}"
+    echo '             The server is up and the desktop app can connect. To enable local'
+    echo '             agent runtime, fix the daemon on the remote (commonly: run'
+    echo "             'multica login' once on $(hostname -s)) — the systemd unit is"
+    echo '             still enabled and will auto-restart on success.'
+    exit 0
+fi
+echo 'VERIFY OK (daemon)'
 '@
     $restartResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" ($restartScript -replace '\r') 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -565,9 +609,262 @@ echo 'VERIFY OK'
     }
     Write-Host $restartResult
 
-    Write-DesktopConfig
+    # Distinguish a fully-green verify from a soft skip on the daemon.
+    if ($restartResult -match 'DAEMON_SKIP') {
+        Write-Yellow "==> Remote server synced + restarted. Daemon (local agent runtime) is unavailable."
+        Write-Yellow "    Install an agent CLI on the remote to enable it."
+    } else {
+        Write-Green "==> Remote server synced + restarted + verified ==================="
+    }
 
-    Write-Green "==> Remote server synced + restarted + verified ==================="
+    Write-DesktopConfig
+}
+
+# ── Login Remote (one-time daemon auth) ─────────────────────────────────────
+# The local agent runtime (multica-daemon) requires a `mul_xxx` personal
+# access token to talk to the server. This routine mints one end-to-end
+# from the .ps1 script, then installs it on the remote:
+#
+#   1. POST /auth/send-code              → server prints [DEV] code to log
+#   2. POST /auth/verify-code (888888)   → JWT (dev bypass; works whenever
+#                                          APP_ENV != production and the
+#                                          server's .env has the dev code)
+#   3. POST /api/tokens (Bearer JWT)     → mul_xxx PAT
+#   4. SSH + pipe PAT into `multica login --token ''` (stdin path keeps the
+#      token out of argv / shell history / `ps`)
+#   5. sudo systemctl restart multica-daemon, verify active
+#
+# The user only supplies the email; everything else is automatic.
+function Invoke-LoginRemote {
+    Write-Cyan "==> Login: authenticate remote daemon ($REMOTE_SSH_USER@$REMOTE_DEV_HOST) ==="
+
+    if (-not $REMOTE_DEV_HOST) {
+        Write-Red "  REMOTE_DEV_HOST is empty — cannot login."
+        return
+    }
+
+    $apiBase = "http://${REMOTE_DEV_HOST}:8080"
+
+    # Sanity-check the server is actually up before we burn an email.
+    try {
+        $cfg = Invoke-RestMethod -Uri "$apiBase/api/config" -TimeoutSec 5
+    } catch {
+        Write-Red "  Cannot reach $apiBase — is the multica-server running?"
+        Write-Red "  $_"
+        return
+    }
+
+    $defaultEmail = "yg@local"
+    $email = (Read-Host "  Email to register/login as [default: $defaultEmail]").Trim()
+    if (-not $email) { $email = $defaultEmail }
+    if ($email -notmatch '^[^@\s]+@[^@\s]+$') {
+        Write-Red "  '$email' is not a valid email (must contain '@' and a domain)."
+        return
+    }
+
+    # Step 1: send-code. Server logs the code in dev mode (no SMTP needed);
+    # the verify step uses the static 888888 dev code so we never need to
+    # scrape the log here.
+    Write-Cyan "  Step 1/4: requesting verification code..."
+    try {
+        $sendResp = Invoke-RestMethod -Uri "$apiBase/auth/send-code" `
+            -Method Post -ContentType "application/json" `
+            -Body (ConvertTo-Json @{email = $email} -Compress) `
+            -TimeoutSec 15
+    } catch {
+        Write-Red "  send-code failed: $_"
+        return
+    }
+    Write-Yellow "    server: $($sendResp.message)"
+
+    # Step 2: verify-code with the dev bypass.
+    Write-Cyan "  Step 2/4: verifying with dev code..."
+    try {
+        $verifyResp = Invoke-RestMethod -Uri "$apiBase/auth/verify-code" `
+            -Method Post -ContentType "application/json" `
+            -Body (ConvertTo-Json @{email = $email; code = "888888"} -Compress) `
+            -TimeoutSec 15
+    } catch {
+        $msg = $_.Exception.Message
+        try { $msg = ($_.ErrorDetails | ConvertFrom-Json).message } catch {}
+        Write-Red "  verify-code failed: $msg"
+        Write-Yellow "  (Is MULTICA_DEV_VERIFICATION_CODE=888888 set on the remote .env?"
+        Write-Yellow "   Is APP_ENV != production? See deploy/systemd/install.sh.)"
+        return
+    }
+    $jwt = $verifyResp.token
+    if (-not $jwt) {
+        Write-Red "  verify-code did not return a token. Got: $($verifyResp | ConvertTo-Json -Compress)"
+        return
+    }
+    Write-Yellow "    authenticated as $($verifyResp.user.email) ($($verifyResp.user.name))"
+
+    # Step 3: mint a mul_ PAT. The handler at /api/tokens is what the web UI
+    # uses for "Personal Access Tokens" — same endpoint.
+    Write-Cyan "  Step 3/4: minting personal access token..."
+    try {
+        $patResp = Invoke-RestMethod -Uri "$apiBase/api/tokens" `
+            -Method Post -ContentType "application/json" `
+            -Headers @{Authorization = "Bearer $jwt"} `
+            -Body (ConvertTo-Json @{name = "daemon-auto-sync"} -Compress) `
+            -TimeoutSec 15
+    } catch {
+        $msg = $_.Exception.Message
+        try { $msg = ($_.ErrorDetails | ConvertFrom-Json).message } catch {}
+        Write-Red "  mint PAT failed: $msg"
+        return
+    }
+    $pat = $patResp.token
+    if (-not $pat -or $pat -notmatch '^mul_') {
+        Write-Red "  PAT response missing or malformed mul_ token. Got: $($patResp | ConvertTo-Json -Compress)"
+        return
+    }
+    $patPreview = if ($pat.Length -gt 12) { $pat.Substring(0, 12) + '...' } else { $pat }
+    Write-Yellow "    minted: $patPreview"
+
+    # Step 4: install on remote. Token goes through stdin (`multica login`
+    # prompts on stdin when --token is empty), keeping it out of argv,
+    # /proc, and shell history. We also need to use TTY allocation for
+    # the daemon restart; `sudo` may prompt for the password on first call
+    # in a session, so we add a small grace period.
+    Write-Cyan "  Step 4/4: applying token on remote and restarting daemon..."
+    $remoteCmd = @'
+set -e
+# Pipe the token (already on stdin from PowerShell) into multica login's
+# interactive prompt. multica login --token '' reads from stdin when the
+# value is empty — see runAuthLoginToken in cmd_auth.go.
+multica login --token '' < /dev/stdin
+sudo systemctl restart multica-daemon.service
+sleep 4
+if systemctl is-active --quiet multica-daemon.service; then
+    echo 'LOGIN_VERIFY_OK'
+else
+    echo 'LOGIN_VERIFY_FAILED'
+    sudo systemctl status multica-daemon.service --no-pager -l
+    tail -20 ~/__work/multica/logs/daemon.log 2>/dev/null
+    exit 1
+fi
+'@
+    # ssh -T disables pseudo-tty allocation; stdin is forwarded directly.
+    # The PAT goes to a unique temp file via scp, then `multica login` reads
+    # it via stdin redirect. The remote file is rm'd immediately after use.
+    $tmpLocal = [System.IO.Path]::GetTempFileName()
+    $tmpRemote = "/tmp/.multica-pat-$([System.Guid]::NewGuid().ToString('N'))"
+    try {
+        Set-Content -Path $tmpLocal -Value $pat -NoNewline -Encoding UTF8
+        scp $tmpLocal "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}:$tmpRemote" 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "scp upload failed (exit $LASTEXITCODE)" }
+
+        $applyScript = @"
+set -e
+# Use the absolute path the systemd unit uses — interactive SSH sessions
+# don't inherit the unit's PATH override.
+$REMOTE_PROJECT_DIR/server/bin/multica login --token '' < '$tmpRemote'
+rm -f '$tmpRemote'
+sudo systemctl restart multica-daemon.service
+sleep 4
+if systemctl is-active --quiet multica-daemon.service; then
+    echo 'LOGIN_VERIFY_OK'
+else
+    echo 'LOGIN_VERIFY_FAILED'
+    sudo systemctl status multica-daemon.service --no-pager -l
+    tail -20 \$HOME/__work/multica/logs/daemon.log 2>/dev/null
+    exit 1
+fi
+"@
+        $applyResult = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" ($applyScript -replace '\r') 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Red "  Remote login/restart failed (exit $LASTEXITCODE):"
+            Write-Host $applyResult
+            ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" "rm -f '$tmpRemote'" 2>&1 | Out-Null
+            return
+        }
+        Write-Host $applyResult
+    } finally {
+        Remove-Item $tmpLocal -ErrorAction SilentlyContinue
+    }
+
+    Write-Green "==> Login complete: local agent runtime is now available =========="
+}
+
+# ── Fetch Verification Code ─────────────────────────────────────────────────
+# The dev server prints the 6-digit code to stdout (no SMTP configured).
+# systemd redirects multica-server's stdout to ~/__work/multica/logs/server.log,
+# so we just SSH in and grep for the latest [DEV] line for the given email.
+#
+# Flow:
+#   1. Trigger POST /auth/send-code so a fresh code is generated.
+#      Falls through gracefully if rate-limited (60s window) and reuses
+#      whatever code is already pending.
+#   2. grep the server log for the most recent code for that email.
+#   3. Print the last 3 codes (so the user can see whether the latest was
+#      already used and pick a different one if so) and copy the latest
+#      to the Windows clipboard for paste into the desktop app.
+function Invoke-FetchVerificationCode {
+    param([string]$Email = "")
+
+    if (-not $Email) {
+        $default = if ($env:USERNAME) { "$env:USERNAME@local" } else { "yg@local" }
+        $Email = (Read-Host "  Email to fetch code for [default: $default]").Trim()
+        if (-not $Email) { $Email = $default }
+    }
+
+    if (-not $REMOTE_DEV_HOST) {
+        Write-Red "  REMOTE_DEV_HOST is empty — cannot fetch."
+        return
+    }
+
+    $apiBase = "http://${REMOTE_DEV_HOST}:8080"
+    $remoteLog = '$HOME/__work/multica/logs/server.log'
+
+    Write-Cyan "==> Code: latest verification code for $Email ===================="
+
+    Write-Cyan "  Step 1/3: requesting fresh code..."
+    try {
+        $sendResp = Invoke-RestMethod -Uri "$apiBase/auth/send-code" `
+            -Method Post -ContentType "application/json" `
+            -Body (ConvertTo-Json @{email = $Email} -Compress) `
+            -TimeoutSec 15
+        Write-Yellow "    server: $($sendResp.message)"
+    } catch {
+        $msg = $_.Exception.Message
+        try { $msg = ($_.ErrorDetails | ConvertFrom-Json).message } catch {}
+        if ($msg -match 'please wait') {
+            Write-Yellow "    rate-limited (60s window); reusing the most recent code"
+        } else {
+            Write-Red "    send-code failed: $msg"
+            return
+        }
+    }
+
+    Write-Cyan "  Step 2/3: reading code from server log..."
+    $sshCmd = "grep '\[DEV\] Verification code for $Email' $remoteLog | tail -1"
+    $raw = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" $sshCmd 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Red "    grep failed (exit $LASTEXITCODE): $raw"
+        return
+    }
+
+    if ($raw -notmatch '\[DEV\] Verification code for [^:]+:\s*(\d{6})') {
+        Write-Red "    no [DEV] code found for $Email in $remoteLog"
+        return
+    }
+    $code = $matches[1]
+    Write-Green "    latest code: $code"
+
+    Write-Cyan "  Step 3/3: last 3 codes for $Email..."
+    $recent = ssh "${REMOTE_SSH_USER}@${REMOTE_DEV_HOST}" `
+        "grep '\[DEV\] Verification code for $Email' $remoteLog | tail -3" 2>&1
+    $recent | ForEach-Object { Write-Yellow "    $_" }
+
+    # Copy to clipboard for quick paste into the desktop app.
+    try {
+        Set-Clipboard -Value $code -ErrorAction Stop
+        Write-Green "==> Latest code: $code  (copied to clipboard) =================="
+    } catch {
+        try { $code | & clip.exe; Write-Green "==> Latest code: $code  (copied to clipboard) ==================" }
+        catch { Write-Green "==> Latest code: $code ==========================================" }
+    }
 }
 
 # ── Ensure on feature branch ────────────────────────────────────────────────
@@ -632,16 +929,22 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  5) Sync   — sync server/ to remote ($REMOTE_DEV_HOST), build, restart, verify"
     Write-Host ""
+    Write-Host "  6) Login  — authenticate remote daemon (one-time, uses dev code if set)"
+    Write-Host ""
+    Write-Host "  7) GetCode — fetch latest verification code for an email (dev server prints to log)"
+    Write-Host ""
     Write-Host "  0) Exit"
     Write-Host ""
     Write-Host "===========================================" -ForegroundColor Cyan
-    $choice = Read-Host "  Select [0-5]"
+    $choice = Read-Host "  Select [0-7]"
     switch ($choice) {
         "1" { try { Invoke-Pull } catch { Write-Red "Pull failed: $_" } }
         "2" { try { Invoke-Buildexe } catch { Write-Red "Build failed: $_" } }
         "3" { try { Invoke-BuildDev } catch { Write-Red "Fast build failed: $_" } }
         "4" { try { Invoke-PushFeature } catch { Write-Red "Push failed: $_" } }
         "5" { try { Invoke-SyncRemoteServer } catch { Write-Red "Sync failed: $_" } }
+        "6" { try { Invoke-LoginRemote } catch { Write-Red "Login failed: $_" } }
+        "7" { try { Invoke-FetchVerificationCode } catch { Write-Red "Fetch code failed: $_" } }
         "0" { Write-Host "Bye."; exit 0 }
         default { Write-Red "  Invalid choice: $choice" }
     }
@@ -659,9 +962,14 @@ function Main {
     switch ($Action) {
         "pull"  { try { Invoke-Pull } catch { Write-Red "Pull failed: $_"; exit 1 } }
         "build" { try { Invoke-Buildexe } catch { Write-Red "Build failed: $_"; exit 1 } }
-        "fast" { try { Invoke-BuildDev } catch { Write-Red "Fast build failed: $_"; exit 1 } }
+        "fast"  { try { Invoke-BuildDev } catch { Write-Red "Fast build failed: $_"; exit 1 } }
         "push"  { try { Invoke-PushFeature } catch { Write-Red "Push failed: $_"; exit 1 } }
         "sync"  { try { Invoke-SyncRemoteServer } catch { Write-Red "Sync failed: $_"; exit 1 } }
+        "login" { try { Invoke-LoginRemote } catch { Write-Red "Login failed: $_"; exit 1 } }
+        "code"  {
+            $email = if ($args.Count -gt 0) { [string]$args[0] } else { "" }
+            try { Invoke-FetchVerificationCode -Email $email } catch { Write-Red "Fetch code failed: $_"; exit 1 }
+        }
         default {
             while ($true) { Show-Menu }
         }
